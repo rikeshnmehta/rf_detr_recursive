@@ -1,0 +1,17 @@
+*.pth
+__pycache__/
+data/
+output/
+work_dir/
+wandb/
+.venv/
+.output_rf_base/
+.output_sem_ft/
+rf-detr-semantic/
+*.log
+run_semantic.sh
+run_semantic_contd.sh
+train_semantic.py
+train_semantic_contd.py
+output_sem_ft/
+output_rf_base/
