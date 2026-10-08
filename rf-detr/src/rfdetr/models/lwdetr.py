@@ -44,7 +44,7 @@ from rfdetr.models.criterion import (  # noqa: F401 — backward compat
 )
 from rfdetr.models.heads.segmentation import SegmentationHead
 from rfdetr.models.matcher import build_matcher
-from rfdetr.models.math import MLP
+from rfdetr.models.math import MLP, inverse_sigmoid
 from rfdetr.models.postprocess import PostProcess
 from rfdetr.models.transformer import build_transformer
 from rfdetr.utilities.tensors import NestedTensor, nested_tensor_from_tensor_list
@@ -95,6 +95,7 @@ class LWDETR(nn.Module):
         two_stage=False,
         lite_refpoint_refine=False,
         bbox_reparam=False,
+        recursive_stages: int = 1,
     ):
         """Initializes the model.
 
@@ -112,6 +113,12 @@ class LWDETR(nn.Module):
         self.num_queries = num_queries
         self.transformer = transformer
         hidden_dim = transformer.d_model
+        if isinstance(recursive_stages, bool) or not isinstance(recursive_stages, int) or recursive_stages < 1:
+            raise ValueError("recursive_stages must be a positive integer")
+        if recursive_stages > 1 and (transformer.dec_layers < 1 or segmentation_head is not None):
+            raise ValueError("recursive refinement requires a detection decoder")
+        self.recursive_stages = recursive_stages
+        self.notes_mlp = MLP(2 * hidden_dim, hidden_dim, hidden_dim, 2) if recursive_stages > 1 else None
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.segmentation_head = segmentation_head
@@ -182,6 +189,70 @@ class LWDETR(nn.Module):
             if hasattr(m, "export") and isinstance(m.export, Callable) and hasattr(m, "_export") and not m._export:
                 m.export()
 
+    def _decode_stages(
+        self,
+        srcs: list[torch.Tensor],
+        masks: Optional[list[torch.Tensor]],
+        poss: list[torch.Tensor],
+        refpoint_embed: torch.Tensor,
+        query_feat: torch.Tensor,
+    ) -> tuple[list[dict], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Reuse the decoder over fixed query slots, carrying content, notes, and boxes.
+
+        The first pass uses the standard learned queries and encoder proposals. Later
+        passes update notes with an MLP over previous content and notes, and use the
+        previous predicted boxes as spatial references. Notes are local to a forward
+        call; no state or gradient is detached across stages.
+
+        Args:
+            srcs: Backbone feature levels, computed once per image batch.
+            masks: Padding masks, or None during export.
+            poss: Positional embeddings for the backbone features.
+            refpoint_embed: Standard initial reference point embeddings.
+            query_feat: Standard learned content queries.
+
+        Returns:
+            Stage prediction dictionaries, final hidden states, first-pass encoder
+            features, and first-pass encoder boxes.
+        """
+        stages = []
+        notes = None
+        hs_enc = ref_enc = None
+        for stage_id in range(self.recursive_stages):
+            hs, references, encoder_features, encoder_boxes = self.transformer(
+                srcs, masks, poss, refpoint_embed, query_feat
+            )
+            if stage_id == 0:
+                hs_enc, ref_enc = encoder_features, encoder_boxes
+            if hs is None:
+                return stages, hs, hs_enc, ref_enc
+
+            layer_hs = hs.unsqueeze(0) if self._export else hs
+            layer_references = references.unsqueeze(0) if self._export else references
+            if self.bbox_reparam:
+                delta = self.bbox_embed(layer_hs)
+                center = delta[..., :2] * layer_references[..., 2:] + layer_references[..., :2]
+                size = delta[..., 2:].exp() * layer_references[..., 2:]
+                boxes = torch.cat([center, size], dim=-1)
+            else:
+                boxes = (self.bbox_embed(layer_hs) + layer_references).sigmoid()
+            logits = self.class_embed(layer_hs)
+            predictions = {"pred_logits": logits[-1], "pred_boxes": boxes[-1]}
+            if self.aux_loss and not self._export:
+                predictions["aux_outputs"] = self._set_aux_loss(logits, boxes, None)
+            stages.append(predictions)
+
+            if stage_id + 1 < self.recursive_stages:
+                content = layer_hs[-1]
+                if notes is None:
+                    notes = torch.zeros_like(content)
+                notes = self.notes_mlp(torch.cat([content, notes], dim=-1))
+                query_feat = content + notes
+                refpoint_embed = predictions["pred_boxes"]
+                if not self.bbox_reparam:
+                    refpoint_embed = inverse_sigmoid(refpoint_embed)
+        return stages, hs, hs_enc, ref_enc
+
     def forward(self, samples: NestedTensor, targets=None):
         """The forward expects a NestedTensor, which consists of:
 
@@ -197,6 +268,7 @@ class LWDETR(nn.Module):
                            information on how to retrieve the unnormalized bounding box.
            - "aux_outputs": Optional, only returned when auxiliary losses are activated. It is a list of
                             dictionaries containing the two above keys for each decoder layer.
+           - "recursive_outputs": Predictions from all refinement stages, including their layer auxiliaries.
         """
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
@@ -221,33 +293,18 @@ class LWDETR(nn.Module):
         if self.segmentation_head is not None:
             seg_head_fwd = self.segmentation_head.sparse_forward if self.training else self.segmentation_head.forward
 
-        hs, ref_unsigmoid, hs_enc, ref_enc = self.transformer(
-            srcs, masks, poss, refpoint_embed_weight, query_feat_weight
-        )
+        stages, hs, hs_enc, ref_enc = self._decode_stages(srcs, masks, poss, refpoint_embed_weight, query_feat_weight)
 
         if hs is not None:
-            if self.bbox_reparam:
-                outputs_coord_delta = self.bbox_embed(hs)
-                outputs_coord_cxcy = outputs_coord_delta[..., :2] * ref_unsigmoid[..., 2:] + ref_unsigmoid[..., :2]
-                outputs_coord_wh = outputs_coord_delta[..., 2:].exp() * ref_unsigmoid[..., 2:]
-                outputs_coord = torch.concat([outputs_coord_cxcy, outputs_coord_wh], dim=-1)
-            else:
-                outputs_coord = (self.bbox_embed(hs) + ref_unsigmoid).sigmoid()
-
-            outputs_class = self.class_embed(hs)
-
             if self.segmentation_head is not None:
                 outputs_masks = seg_head_fwd(features[0].tensors, hs, samples.tensors.shape[-2:])
-
-            out = {"pred_logits": outputs_class[-1], "pred_boxes": outputs_coord[-1]}
-            if self.segmentation_head is not None:
-                out["pred_masks"] = outputs_masks[-1]
-            if self.aux_loss:
-                out["aux_outputs"] = self._set_aux_loss(
-                    outputs_class,
-                    outputs_coord,
-                    outputs_masks if self.segmentation_head is not None else None,
-                )
+                stages[-1]["pred_masks"] = outputs_masks[-1]
+                if self.aux_loss:
+                    for auxiliary, mask in zip(stages[-1]["aux_outputs"], outputs_masks[:-1]):
+                        auxiliary["pred_masks"] = mask
+            # Copy the final dictionary before attaching encoder outputs, so encoder
+            # supervision is represented once rather than duplicated in every stage.
+            out = {**stages[-1], "recursive_outputs": stages}
 
         if self.two_stage:
             group_detr = self.group_detr if self.training else 1
@@ -286,21 +343,13 @@ class LWDETR(nn.Module):
         refpoint_embed_weight = self.refpoint_embed.weight[: self.num_queries]
         query_feat_weight = self.query_feat.weight[: self.num_queries]
 
-        hs, ref_unsigmoid, hs_enc, ref_enc = self.transformer(
-            srcs, None, poss, refpoint_embed_weight, query_feat_weight
-        )
+        stages, hs, hs_enc, ref_enc = self._decode_stages(srcs, None, poss, refpoint_embed_weight, query_feat_weight)
 
         outputs_masks = None
 
         if hs is not None:
-            if self.bbox_reparam:
-                outputs_coord_delta = self.bbox_embed(hs)
-                outputs_coord_cxcy = outputs_coord_delta[..., :2] * ref_unsigmoid[..., 2:] + ref_unsigmoid[..., :2]
-                outputs_coord_wh = outputs_coord_delta[..., 2:].exp() * ref_unsigmoid[..., 2:]
-                outputs_coord = torch.concat([outputs_coord_cxcy, outputs_coord_wh], dim=-1)
-            else:
-                outputs_coord = (self.bbox_embed(hs) + ref_unsigmoid).sigmoid()
-            outputs_class = self.class_embed(hs)
+            outputs_coord = stages[-1]["pred_boxes"]
+            outputs_class = stages[-1]["pred_logits"]
             if self.segmentation_head is not None:
                 outputs_masks = self.segmentation_head(
                     srcs[0],
@@ -455,6 +504,7 @@ def build_model(args: "BuilderArgs"):
         two_stage=args.two_stage,
         lite_refpoint_refine=args.lite_refpoint_refine,
         bbox_reparam=args.bbox_reparam,
+        recursive_stages=getattr(args, "recursive_stages", 1),
     )
     return model
 
@@ -467,7 +517,6 @@ def build_criterion_and_postprocessors(args: "BuilderArgs"):
     if args.segmentation_head:
         weight_dict["loss_mask_ce"] = args.mask_ce_loss_coef
         weight_dict["loss_mask_dice"] = args.mask_dice_loss_coef
-    # TODO this is a hack
     if args.aux_loss:
         aux_weight_dict = {}
         for i in range(args.dec_layers - 1):
@@ -475,6 +524,20 @@ def build_criterion_and_postprocessors(args: "BuilderArgs"):
         if args.two_stage:
             aux_weight_dict.update({k + "_enc": v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
+
+    recursive_stages = getattr(args, "recursive_stages", 1)
+    stage_weights = getattr(args, "recursive_stage_weights", None)
+    stage_weights = [1.0] * recursive_stages if stage_weights is None else stage_weights
+    if len(stage_weights) != recursive_stages:
+        raise ValueError("recursive_stage_weights must contain one weight per recursive stage")
+    # Keep the final-stage loss names used by the training loop. Earlier stages
+    # get distinct names, including their decoder-layer auxiliary losses.
+    decoder_weights = {key: value for key, value in weight_dict.items() if not key.endswith("_enc")}
+    weight_dict.update({key: value * stage_weights[-1] for key, value in decoder_weights.items()})
+    for stage_id in range(recursive_stages - 1):
+        weight_dict.update(
+            {f"{key}_recursive_{stage_id}": value * stage_weights[stage_id] for key, value in decoder_weights.items()}
+        )
 
     losses = ["labels", "boxes", "cardinality"]
     if args.segmentation_head:
@@ -494,6 +557,7 @@ def build_criterion_and_postprocessors(args: "BuilderArgs"):
             use_position_supervised_loss=args.use_position_supervised_loss,
             ia_bce_loss=args.ia_bce_loss,
             mask_point_sample_ratio=args.mask_point_sample_ratio,
+            recursive_stages=recursive_stages,
         )
     else:
         criterion = SetCriterion(
@@ -507,6 +571,7 @@ def build_criterion_and_postprocessors(args: "BuilderArgs"):
             use_varifocal_loss=args.use_varifocal_loss,
             use_position_supervised_loss=args.use_position_supervised_loss,
             ia_bce_loss=args.ia_bce_loss,
+            recursive_stages=recursive_stages,
         )
     criterion.to(device)
     postprocess = PostProcess(num_select=args.num_select)

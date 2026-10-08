@@ -5,6 +5,7 @@
 # ------------------------------------------------------------------------
 
 
+import math
 import os
 import warnings
 from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, TypeAlias, Union
@@ -87,6 +88,8 @@ class ModelConfig(BaseConfig):
     encoder: EncoderName
     out_feature_indexes: List[int]
     dec_layers: int
+    recursive_stages: int = Field(default=1, ge=1, strict=True)
+    recursive_stage_weights: Optional[List[float]] = None
     two_stage: bool = True
     projector_scale: List[Literal["P3", "P4", "P5"]]
     hidden_dim: int
@@ -131,6 +134,19 @@ class ModelConfig(BaseConfig):
             "without inspecting ``pretrain_weights``."
         ),
     )
+
+    @model_validator(mode="after")
+    def _validate_recursive_decoder(self) -> "ModelConfig":
+        """Validate detection refinement stages and their optional loss weights."""
+        if self.recursive_stages > 1 and (self.dec_layers < 1 or self.segmentation_head):
+            raise ValueError("recursive refinement requires a detection model with dec_layers >= 1")
+        weights = self.recursive_stage_weights
+        if weights is not None:
+            if len(weights) != self.recursive_stages:
+                raise ValueError("recursive_stage_weights must contain one weight per recursive stage")
+            if any(not math.isfinite(weight) or weight < 0 for weight in weights) or not any(weights):
+                raise ValueError("recursive_stage_weights must be finite, nonnegative, and have a positive total")
+        return self
 
     @model_validator(mode="after")
     def _warn_deprecated_model_config_fields(self) -> "ModelConfig":
@@ -454,6 +470,7 @@ class RFDETRMediumConfig(RFDETRBaseConfig):
     out_feature_indexes: List[int] = [3, 6, 9, 12]
     num_windows: int = 2
     dec_layers: int = 4
+    recursive_stages: int = Field(default=3, ge=1, strict=True)
     patch_size: int = 16
     resolution: int = 576
     positional_encoding_size: int = 36

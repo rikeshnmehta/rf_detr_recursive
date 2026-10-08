@@ -207,6 +207,11 @@ uv run twine check --strict dist/*
 
 **Model Architecture:**
 
+- `RFDETRMediumConfig.recursive_stages` defaults to 3; other variants default to 1.
+- `LWDETR._decode_stages()` reuses the decoder with a fixed query count. Later stages carry
+    `notes_mlp([previous_content, previous_notes])` and previous predicted boxes; never detach these across stages.
+- `recursive_outputs` contains every stage and its layer auxiliaries. `SetCriterion` matches each stage independently;
+    `recursive_stage_weights` scales stage loss coefficients in `weight_dict`. Encoder supervision occurs once.
 - RFDETR wrappers: `self.model` is the model context returned by `get_model()`
 - Underlying PyTorch module: `self.model.model`
 - Segmentation models return `pred_masks` as `torch.Tensor` or dict with keys `['spatial_features', 'query_features', 'bias']`

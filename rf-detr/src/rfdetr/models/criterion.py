@@ -146,6 +146,7 @@ class SetCriterion(nn.Module):
         use_position_supervised_loss=False,
         ia_bce_loss=False,
         mask_point_sample_ratio: int = 16,
+        recursive_stages: int = 1,
     ):
         """Create the criterion.
 
@@ -169,6 +170,7 @@ class SetCriterion(nn.Module):
         self.use_position_supervised_loss = use_position_supervised_loss
         self.ia_bce_loss = ia_bce_loss
         self.mask_point_sample_ratio = mask_point_sample_ratio
+        self.recursive_stages = recursive_stages
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
         """Classification loss (Binary focal loss) targets dicts must contain the key "labels" containing a tensor of
@@ -482,28 +484,34 @@ class SetCriterion(nn.Module):
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
         group_detr = self.group_detr if self.training else 1
-        outputs_without_aux = {k: v for k, v in outputs.items() if k != "aux_outputs"}
-
-        # Retrieve the matching between the outputs of the last layer and the targets
-        indices = self.matcher(outputs_without_aux, targets, group_detr=group_detr)
+        stages = outputs.get("recursive_outputs", [outputs])
+        if "recursive_outputs" in outputs and len(stages) != self.recursive_stages:
+            raise ValueError("recursive_outputs length does not match the configured recursive_stages")
 
         # Compute the average number of target boxes across all nodes, for normalization purposes
         num_boxes = sum(len(t["labels"]) for t in targets)
         if not self.sum_group_losses:
             num_boxes = num_boxes * group_detr
-        num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device)
+        num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=outputs["pred_logits"].device)
         if is_dist_avail_and_initialized():
             torch.distributed.all_reduce(num_boxes)
         num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item()
 
-        # Compute all the requested losses
+        # Each refinement stage gets an independent Hungarian assignment and
+        # decoder-layer auxiliary supervision. The top-level final predictions
+        # are aliases, so they must not be supervised a second time.
         losses = {}
-        for loss in self.losses:
-            losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes))
+        for stage_id, stage in enumerate(stages):
+            final_stage = stage_id == len(stages) - 1
+            suffix = "" if final_stage else f"_recursive_{stage_id}"
+            predictions = {key: value for key, value in stage.items() if key.startswith("pred_")}
+            indices = self.matcher(predictions, targets, group_detr=group_detr)
+            for loss in self.losses:
+                kwargs = {"log": final_stage} if loss == "labels" else {}
+                stage_losses = self.get_loss(loss, stage, targets, indices, num_boxes, **kwargs)
+                losses.update({key + suffix: value for key, value in stage_losses.items()})
 
-        # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
-        if "aux_outputs" in outputs:
-            for i, aux_outputs in enumerate(outputs["aux_outputs"]):
+            for i, aux_outputs in enumerate(stage.get("aux_outputs", [])):
                 indices = self.matcher(aux_outputs, targets, group_detr=group_detr)
                 for loss in self.losses:
                     kwargs = {}
@@ -511,7 +519,7 @@ class SetCriterion(nn.Module):
                         # Logging is enabled only for the last layer
                         kwargs = {"log": False}
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes, **kwargs)
-                    l_dict = {k + f"_{i}": v for k, v in l_dict.items()}
+                    l_dict = {k + f"_{i}" + suffix: v for k, v in l_dict.items()}
                     losses.update(l_dict)
 
         if "enc_outputs" in outputs:

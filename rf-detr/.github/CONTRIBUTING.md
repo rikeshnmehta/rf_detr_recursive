@@ -171,6 +171,15 @@ uv run twine check --strict dist/*
 
 We follow test-driven development practices to ensure code quality and prevent regressions.
 
+### Recursive Decoder Verification
+
+This repository's Medium decoder defaults to three shared refinement passes. Before pushing recursive decoder changes,
+run `python scripts/smoke_recursive_decoder.py` from `rf-detr/`. The smoke test builds a real `RFDETRMedium` with random
+weights on CPU, uses images of shape `[2, 3, 128, 128]` and synthetic COCO targets, and verifies Hungarian losses,
+backpropagation under anomaly detection, and two AdamW steps. Use `--group-detr 13` to check the standard training groups.
+Also run `pytest tests/models/test_recursive_decoder.py` for stage weights, query counts, empty targets, and gradients
+through inter-stage references and notes. The requested forward, backward, and optimizer checks must pass before pushing.
+
 ### For Bug Fixes
 
 1. **Write a test that replicates the issue** - The test should fail initially, demonstrating the bug

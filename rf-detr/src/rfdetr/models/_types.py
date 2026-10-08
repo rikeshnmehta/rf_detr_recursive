@@ -35,6 +35,8 @@ class BuilderArgs(Protocol):
     encoder: str
     out_feature_indexes: List[int]
     dec_layers: int
+    recursive_stages: int
+    recursive_stage_weights: Optional[List[float]]
     freeze_encoder: bool
     backbone_lora: bool
     two_stage: bool

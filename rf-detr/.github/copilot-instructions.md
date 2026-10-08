@@ -91,6 +91,9 @@ from tqdm.auto import tqdm  # NOT from tqdm import tqdm
 
 **Project-Specific Patterns:**
 
+- **Recursive Medium decoder:** `recursive_stages=3` reuses decoder weights and query slots. Carry memory notes and
+    predicted-box references without detaching across stages. Match all `recursive_outputs` independently and apply
+    `recursive_stage_weights` through the criterion's `weight_dict`; supervise encoder predictions once.
 - **Logging:** Use `logger.debug()` for detailed tensor/shape info (not `logger.info()`)
 - **Segmentation models:** Return `pred_masks` as `torch.Tensor` or dict with keys `['spatial_features', 'query_features', 'bias']`
 - **Checkpoint handling:** Always check file existence before operations

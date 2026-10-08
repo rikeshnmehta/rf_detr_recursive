@@ -223,6 +223,9 @@ class Transformer(nn.Module):
         return valid_ratio
 
     def forward(self, srcs, masks, pos_embeds, refpoint_embed, query_feat):
+        # Learned queries are unbatched at stage 1. Later stages supply batched
+        # content and predicted boxes, and must not generate new proposals.
+        initial_stage = query_feat.ndim == 2
         src_flatten = []
         mask_flatten = [] if masks is not None else None
         lvl_pos_embed_flatten = []
@@ -253,7 +256,7 @@ class Transformer(nn.Module):
         lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)  # bs, \sum{hxw}, c
         level_start_index = torch.cat((spatial_shapes.new_zeros((1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
 
-        if self.two_stage:
+        if self.two_stage and initial_stage:
             output_memory, output_proposals = gen_encoder_output_proposals(
                 memory, mask_flatten, spatial_shapes_hw, unsigmoid=not self.bbox_reparam
             )
@@ -306,9 +309,10 @@ class Transformer(nn.Module):
             # instead of the Python-int `bs` (which bakes batch=8 as a constant Tile op).
             # expand().contiguous() is functionally identical to repeat() but produces
             # a dynamic Expand op that TRT can handle with variable batch sizes.
-            tgt = query_feat.unsqueeze(0).expand(memory.shape[0], -1, -1).contiguous()
-            refpoint_embed = refpoint_embed.unsqueeze(0).expand(memory.shape[0], -1, -1).contiguous()
-            if self.two_stage:
+            tgt = query_feat.unsqueeze(0).expand(memory.shape[0], -1, -1).contiguous() if initial_stage else query_feat
+            if refpoint_embed.ndim == 2:
+                refpoint_embed = refpoint_embed.unsqueeze(0).expand(memory.shape[0], -1, -1).contiguous()
+            if self.two_stage and initial_stage:
                 ts_len = refpoint_embed_ts.shape[-2]
                 refpoint_embed_ts_subset = refpoint_embed[..., :ts_len, :]
                 refpoint_embed_subset = refpoint_embed[..., ts_len:, :]
@@ -339,7 +343,7 @@ class Transformer(nn.Module):
             hs = None
             references = None
 
-        if self.two_stage:
+        if self.two_stage and initial_stage:
             if self.bbox_reparam:
                 return hs, references, memory_ts, boxes_ts
             else:

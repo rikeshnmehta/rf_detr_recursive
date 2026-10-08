@@ -1,15 +1,15 @@
 import sys
 import os
 
-# 1. Force Python to load the UNMODIFIED source code
-sys.path.insert(0, os.path.abspath("./rf-detr"))
+# Load the tracked source and explicitly select the single-pass Medium baseline.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "rf-detr", "src"))
 
 from rfdetr import RFDETRMedium
 
 def main():
-    print("Initializing BASE RF-DETR Base for Fine-Tuning...")
+    print("Initializing BASELINE RF-DETR Medium for Fine-Tuning...")
     checkpoint_path = "/WAVE/users2/unix/rnmehta/hyang_lab/CascadeEXP2/rf_detr_2/output_rf_base/checkpoint_best_total.pth"
-    model = RFDETRMedium(pretrain_weights=checkpoint_path)
+    model = RFDETRMedium(pretrain_weights=checkpoint_path, recursive_stages=1)
     
     model.train(
         dataset_dir="/WAVE/archive/projects/hyang_lab/CascadeEXP2/cascade-detr/cascade_dn_detr/data/coco",

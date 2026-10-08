@@ -46,6 +46,8 @@ _MC_NAMESPACE_FIELDS = {
     "pretrain_weights",
     "projector_scale",
     "resolution",
+    "recursive_stages",
+    "recursive_stage_weights",
     "sa_nheads",
     "segmentation_head",
     "two_stage",
