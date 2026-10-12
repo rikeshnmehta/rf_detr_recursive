@@ -15,3 +15,6 @@ train_semantic.py
 train_semantic_contd.py
 output_sem_ft/
 output_rf_base/
+runs_recursive/
+recursive_logs_*.out
+recursive_logs_*.err
